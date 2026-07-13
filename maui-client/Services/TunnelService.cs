@@ -41,6 +41,13 @@ public sealed class TunnelService : IDisposable
     public event Action<ProbeStatus, string>? OnProbeStatusChanged;
 
     private CancellationTokenSource? _cts;
+    // Retains the currently-running (or last-run) generation task so lifecycle
+    // transitions can await its full teardown. Guarded by _lifecycleLock.
+    private Task? _runTask;
+    // Serializes Start/Stop transitions so a new generation is never set up
+    // while a previous one is still tearing down shared state (listener,
+    // streams, upstream).
+    private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
     private volatile bool _stopping;
     private ClientWebSocket? _upstream;
     private TcpListener? _listener;
@@ -51,6 +58,9 @@ public sealed class TunnelService : IDisposable
     private string _ownConnId = "";
     private string _peerConnId = "";
     private string _staleConnId = "";
+    // Guards compare-and-clear of _peerConnId/_staleConnId so a failed request
+    // can only clear the peer it was actually sent to (never a newer one).
+    private readonly object _peerLock = new();
     private string _iamToken = "";
     private uint _nextStreamId;
 
@@ -121,6 +131,11 @@ public sealed class TunnelService : IDisposable
         public readonly Dictionary<uint, byte[]> ReorderPending = new();
         public readonly object ReorderLock = new();
 
+        // Gap timer: armed when the first out-of-order frame is buffered; fires
+        // if the missing predecessor doesn't arrive within ReorderGapTimeout so
+        // a single lost frame can't stall the stream forever. Guarded by ReorderLock.
+        public Timer? ReorderGapTimer;
+
         public StreamState(uint id, TcpClient client)
         {
             Id = id;
@@ -138,6 +153,7 @@ public sealed class TunnelService : IDisposable
         {
             if (Closed) return;
             Closed = true;
+            try { ReorderGapTimer?.Dispose(); } catch { }
             try { WriteQueue.Writer.TryComplete(); } catch { }
             try { Cts.Cancel(); } catch { }
             try { NetStream.Dispose(); } catch { }
@@ -148,26 +164,63 @@ public sealed class TunnelService : IDisposable
 
     public async Task StartAsync()
     {
-        if (_cts != null)
+        Task run;
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
+        try
         {
-            Log("StartAsync called but already running, ignoring.");
-            return;
+            var previous = _runTask;
+            if (previous != null && !previous.IsCompleted
+                && _cts != null && !_cts.IsCancellationRequested)
+            {
+                // A generation is running and NOT stopping — genuine double start.
+                Log("StartAsync called but already running, ignoring.");
+                return;
+            }
+
+            // If a previous generation is still shutting down (cancelled but not
+            // yet finished), wait for it to fully clean up BEFORE starting a new
+            // one. Its cleanup touches shared state (listener, streams, upstream,
+            // events); letting it overlap a new generation would tear the new
+            // tunnel down.
+            if (previous != null)
+            {
+                try { await previous.ConfigureAwait(false); } catch { }
+            }
+
+            var cts = new CancellationTokenSource();
+            _cts = cts;
+            _stopping = false;
+            _nextStreamId = 1;
+            _helperShortId = 0;
+            _upstreamReady = false;
+            _probeRanThisCycle = false;
+            EmitProbeStatus(ProbeStatus.Idle, "");
+
+            run = RunGenerationAsync(cts);
+            _runTask = run;
         }
-        _cts = new CancellationTokenSource();
-        _nextStreamId = 1;
-        _helperShortId = 0;
-        _upstreamReady = false;
-        _probeRanThisCycle = false;
-        EmitProbeStatus(ProbeStatus.Idle, "");
-        var ct = _cts.Token;
+        finally
+        {
+            _lifecycleLock.Release();
+        }
 
+        // Await the generation OUTSIDE the lock so Stop/StopAsync can cancel
+        // while it runs. Existing callers rely on StartAsync completing only
+        // once the tunnel has fully stopped.
+        await run.ConfigureAwait(false);
+    }
+
+    // Owns one tunnel generation: the upstream loop plus the teardown of every
+    // resource it created. Nothing outside this method tears these down, so a
+    // generation's cleanup can never clobber a different generation's state.
+    private async Task RunGenerationAsync(CancellationTokenSource cts)
+    {
+        var ct = cts.Token;
         Log("Starting tunnel service...");
-        _stopping = false;
-
         try
         {
             // Run upstream loop — it starts the listener after first successful connect
-            await UpstreamLoopAsync(ct);
+            await UpstreamLoopAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { Log($"Service error: {ex.Message}"); }
@@ -179,13 +232,30 @@ public sealed class TunnelService : IDisposable
         OnStopped?.Invoke();
     }
 
+    // Requests cancellation of the running generation without waiting for it to
+    // finish. Prefer StopAsync when you need the tunnel fully torn down before
+    // starting again; StartAsync also serializes against an in-flight stop.
     public void Stop()
     {
         _stopping = true;
         Log("Stop requested.");
+        try { _cts?.Cancel(); } catch { }
+    }
+
+    // Cancels the running generation and awaits its full teardown (listener,
+    // streams, upstream, events) so a subsequent StartAsync can't race the old
+    // cleanup. Safe to call when nothing is running.
+    public async Task StopAsync()
+    {
+        _stopping = true;
+        Log("Stop requested.");
         var cts = _cts;
-        _cts = null;
+        var run = _runTask;
         try { cts?.Cancel(); } catch { }
+        if (run != null)
+        {
+            try { await run.ConfigureAwait(false); } catch { }
+        }
     }
 
     // --- Upstream WebSocket loop ---
@@ -405,10 +475,13 @@ public sealed class TunnelService : IDisposable
                         Log($"PEER_CONN with stale ID {Shorten(peerId)}, ignoring");
                         return;
                     }
-                    _staleConnId = "";
                     // Cancel pending opens from previous peer session
                     CancelPendingOpens("new peer connected");
-                    _peerConnId = peerId;
+                    lock (_peerLock)
+                    {
+                        _staleConnId = "";
+                        _peerConnId = peerId;
+                    }
                     if (iamToken != "") _iamToken = iamToken;
                     Log($"Peer connected: {Shorten(peerId)}");
                     return;
@@ -428,7 +501,7 @@ public sealed class TunnelService : IDisposable
                         return;
                     }
                     Log($"Peer gone, closing {_streams.Count} streams");
-                    _peerConnId = "";
+                    lock (_peerLock) { _peerConnId = ""; }
                     CancelPendingOpens("peer gone");
                     CloseAllStreams();
                     return;
@@ -476,8 +549,15 @@ public sealed class TunnelService : IDisposable
                             tcs.TrySetResult(data);
                             return;
                         }
-                        // Likely a frame for a stream we already closed. Log at debug.
-                        Log($"{Protocol.MsgName(type)} for unknown stream={streamId} seq={seqId}, dropping");
+                        // Likely a frame for a stream we already closed. DATA
+                        // arriving after close (in-flight, or a burst after a
+                        // reconnect) is common and noisy — keep it out of the
+                        // visible log; still surface the rarer control frames
+                        // (FIN/RST/OPEN_*) which are more diagnostic.
+                        if (type == Protocol.MsgData)
+                            System.Diagnostics.Debug.WriteLine($"DATA for unknown stream={streamId} seq={seqId}, dropping");
+                        else
+                            Log($"{Protocol.MsgName(type)} for unknown stream={streamId} seq={seqId}, dropping");
                         return;
                     }
                     DeliverStreamFrameOrdered(s, type, seqId, payload, data);
@@ -528,6 +608,12 @@ public sealed class TunnelService : IDisposable
                     DispatchStreamFrame(s, nType, nPayload, nextRaw);
                     s.ExpectedRecvSeq++;
                 }
+                // The gap (if any) advanced: stop the timer when fully caught
+                // up, else restart it for the next still-missing frame.
+                if (s.ReorderPending.Count == 0)
+                    StopReorderGapTimer(s);
+                else
+                    ArmReorderGapTimer(s);
             }
             else if (seqId > s.ExpectedRecvSeq)
             {
@@ -537,11 +623,17 @@ public sealed class TunnelService : IDisposable
                 if (pending > MaxReorderPending)
                 {
                     overflow = true;
+                    StopReorderGapTimer(s);
                 }
-                else if (pending > 0 && pending % 50 == 0)
+                else
                 {
-                    Log($"reorder buffer growing stream={s.Id} pending={pending} " +
-                        $"expected={s.ExpectedRecvSeq} got={seqId}");
+                    // First out-of-order frame for the current gap: arm the
+                    // timer so a single lost frame can't stall the stream forever.
+                    if (s.ReorderGapTimer == null)
+                        ArmReorderGapTimer(s);
+                    if (pending % 50 == 0)
+                        Log($"reorder buffer growing stream={s.Id} pending={pending} " +
+                            $"expected={s.ExpectedRecvSeq} got={seqId}");
                 }
             }
             else
@@ -559,6 +651,54 @@ public sealed class TunnelService : IDisposable
             catch { }
             CloseStream(s);
         }
+    }
+
+    /// <summary>
+    /// Maximum time a stream may wait for a single missing frame before it is
+    /// reset. Complements <see cref="MaxReorderPending"/>, which only fires when
+    /// many later frames pile up; a lone lost frame followed by a few stragglers
+    /// would otherwise stall the stream indefinitely.
+    /// </summary>
+    private static readonly TimeSpan ReorderGapTimeout = TimeSpan.FromSeconds(30);
+
+    // (Re)arms the reorder gap timer. Caller must hold s.ReorderLock. The timer
+    // captures its own reference so a superseded-but-already-fired callback can
+    // detect it was replaced and skip the reset.
+    private void ArmReorderGapTimer(StreamState s)
+    {
+        s.ReorderGapTimer?.Dispose();
+        Timer? t = null;
+        t = new Timer(_ => OnReorderGapTimeout(s, t!), null,
+            ReorderGapTimeout, Timeout.InfiniteTimeSpan);
+        s.ReorderGapTimer = t;
+    }
+
+    // Cancels the gap timer if running. Caller must hold s.ReorderLock.
+    private static void StopReorderGapTimer(StreamState s)
+    {
+        s.ReorderGapTimer?.Dispose();
+        s.ReorderGapTimer = null;
+    }
+
+    private void OnReorderGapTimeout(StreamState s, Timer self)
+    {
+        lock (s.ReorderLock)
+        {
+            // Superseded by a newer timer (gap advanced/restarted), or the gap
+            // already closed / stream already closed — nothing to do.
+            if (!ReferenceEquals(s.ReorderGapTimer, self))
+                return;
+            if (s.Closed || s.ReorderPending.Count == 0)
+            {
+                StopReorderGapTimer(s);
+                return;
+            }
+            StopReorderGapTimer(s);
+        }
+        Log($"reorder gap timeout stream={s.Id} expected={s.ExpectedRecvSeq} (lost frame?), resetting stream");
+        try { _ = SendToPeerAsync(Protocol.Encode(Protocol.MsgRst, s.Id, NextSeq(s.Id))); }
+        catch { }
+        CloseStream(s);
     }
 
     /// <summary>
@@ -1238,18 +1378,42 @@ public sealed class TunnelService : IDisposable
             await WsSendApi(peer, frame, token);
             return null;
         }
-        catch (Exception ex)
+        catch (WsSendException ex) when (ex.IsConnectionGone)
         {
-            // Mark stale and SYNC
-            _staleConnId = _peerConnId;
-            _peerConnId = "";
-            Log($"wsSend failed: {ex.GetType().Name}: {ex.Message} (peer={peer}), marked stale, sending SYNC");
+            // Definitive: the peer connection is gone (404 NOT_FOUND). Clear it
+            // — but only if it's still the peer we sent to (compare-and-clear),
+            // so a peer that reconnected meanwhile isn't wiped — then SYNC to
+            // discover a fresh one.
+            ClearPeerIfCurrent(peer);
+            Log($"wsSend: peer gone (404) peer={Shorten(peer)}, marked stale, sending SYNC");
             try
             {
                 await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), _cts?.Token ?? CancellationToken.None);
             }
             catch { }
             return ex.Message;
+        }
+        catch (Exception ex)
+        {
+            // Transient (timeout, 429, 5xx, network blip): keep the peer ID so a
+            // healthy peer isn't poisoned. The caller still sees the error and
+            // can retry or reset just the affected stream.
+            Log($"wsSend transient failure (keeping peer={Shorten(peer)}): {ex.GetType().Name}: {ex.Message}");
+            return ex.Message;
+        }
+    }
+
+    // Compare-and-clear: marks the peer stale only if it is still expectedPeer,
+    // so an old/slow failed request can't evict a peer installed since.
+    private void ClearPeerIfCurrent(string expectedPeer)
+    {
+        lock (_peerLock)
+        {
+            if (_peerConnId == expectedPeer && _peerConnId != "")
+            {
+                _staleConnId = _peerConnId;
+                _peerConnId = "";
+            }
         }
     }
 
@@ -1274,8 +1438,20 @@ public sealed class TunnelService : IDisposable
         if (!resp.IsSuccessStatusCode)
         {
             var body = await resp.Content.ReadAsStringAsync();
-            throw new Exception($"wsSend {(int)resp.StatusCode}: {body}");
+            throw new WsSendException((int)resp.StatusCode, $"wsSend {(int)resp.StatusCode}: {body}");
         }
+    }
+
+    /// <summary>
+    /// Carries the HTTP status from a failed wsSend so callers can distinguish a
+    /// definitive "connection gone" (404 NOT_FOUND) from transient failures
+    /// (timeout, 429, 5xx) and avoid discarding a still-valid peer ID.
+    /// </summary>
+    private sealed class WsSendException : Exception
+    {
+        public int StatusCode { get; }
+        public WsSendException(int statusCode, string message) : base(message) => StatusCode = statusCode;
+        public bool IsConnectionGone => StatusCode == 404;
     }
 
     // --- Upstream WS helpers ---
@@ -1289,7 +1465,19 @@ public sealed class TunnelService : IDisposable
         await _writeLock.WaitAsync(ct);
         try
         {
+            // Re-check under the lock: a concurrent reconnect (common on Android
+            // background->foreground) may have swapped or disposed the socket
+            // while we were waiting for the lock.
+            if (!ReferenceEquals(_upstream, ws) || ws.State != WebSocketState.Open)
+                throw new InvalidOperationException("upstream not connected");
             await ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Binary, true, ct);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The socket was aborted/disposed by a concurrent reconnect. Surface
+            // this as a normal transient disconnect instead of a scary
+            // "Cannot access a disposed object (ClientWebSocket)".
+            throw new InvalidOperationException("upstream not connected");
         }
         finally { _writeLock.Release(); }
     }
@@ -1381,11 +1569,19 @@ public sealed class TunnelService : IDisposable
     {
         var ws = _upstream;
         _upstream = null;
-        if (ws != null)
+        if (ws == null) return;
+        // Serialize with any in-flight WsSendUpstream so we don't dispose the
+        // socket mid-send (which would surface as an ObjectDisposedException).
+        // Bounded wait so a hung send can't stall teardown; the send's own
+        // ObjectDisposedException handler covers the residual race.
+        bool locked = false;
+        try { locked = _writeLock.Wait(TimeSpan.FromSeconds(2)); } catch { }
+        try
         {
             try { ws.Abort(); } catch { }
             try { ws.Dispose(); } catch { }
         }
+        finally { if (locked) _writeLock.Release(); }
     }
 
     private void Log(string msg)

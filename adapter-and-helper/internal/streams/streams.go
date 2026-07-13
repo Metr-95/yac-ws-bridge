@@ -19,9 +19,14 @@ type Stream struct {
 	ID   uint32
 	Conn net.Conn
 
-	mu       sync.Mutex
-	closed   bool
-	halfOpen bool // received FIN but not yet closed
+	mu     sync.Mutex
+	closed bool
+	// Half-close bookkeeping. A stream stays alive until BOTH directions have
+	// finished (or either side sends RST):
+	//   localReadEnded   — our Conn hit EOF; we sent FIN to the peer.
+	//   remoteWriteEnded — the peer sent FIN; we half-closed our Conn's write side.
+	localReadEnded   bool
+	remoteWriteEnded bool
 }
 
 // Manager tracks active streams and dispatches incoming frames.
@@ -46,7 +51,10 @@ type reorderBuf struct {
 	mu       sync.Mutex
 	expected uint32
 	pending  map[uint32]protocol.Frame
-	broken   bool // overflowed; stream is being reset, drop further frames
+	broken   bool // overflowed or timed out; stream is being reset, drop further frames
+	// gapTimer fires if a sequence gap is not filled within reorderGapTimeout,
+	// bounding how long a stream may stall behind a single lost frame.
+	gapTimer *time.Timer
 }
 
 func NewManager(send SendFunc) *Manager {
@@ -84,11 +92,7 @@ func (m *Manager) Remove(id uint32) {
 	delete(m.streams, id)
 	m.mu.Unlock()
 	m.seqCounters.Delete(id)
-	if m.Reorder {
-		m.reorderMu.Lock()
-		delete(m.reorderBufs, id)
-		m.reorderMu.Unlock()
-	}
+	m.dropReorderBuf(id)
 }
 
 // SendFrame encodes and sends a frame to the peer.
@@ -109,7 +113,7 @@ func (m *Manager) HandleData(streamID uint32, payload []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.remoteWriteEnded {
 		return
 	}
 	if _, err := s.Conn.Write(payload); err != nil {
@@ -117,7 +121,10 @@ func (m *Manager) HandleData(streamID uint32, payload []byte) {
 	}
 }
 
-// HandleFin processes a graceful close from the peer.
+// HandleFin processes a graceful close from the peer: the peer has finished
+// sending, so we half-close our local write side (the local app reads EOF) but
+// keep the read side open so local->peer data still flows until our own read
+// ends. The stream is fully closed only once BOTH directions are done.
 func (m *Manager) HandleFin(streamID uint32) {
 	s := m.Get(streamID)
 	if s == nil {
@@ -126,10 +133,18 @@ func (m *Manager) HandleFin(streamID uint32) {
 	}
 	log.Printf("[DEBUG] FIN handling stream=%d", streamID)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.halfOpen = true
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.remoteWriteEnded = true
 	if tc, ok := s.Conn.(*net.TCPConn); ok {
-		tc.CloseRead()
+		tc.CloseWrite()
+	}
+	bothDone := s.localReadEnded
+	s.mu.Unlock()
+	if bothDone {
+		m.CloseStream(s)
 	}
 }
 
@@ -182,6 +197,12 @@ func (m *Manager) CloseAll() {
 	// Clear reorder buffers
 	if m.Reorder {
 		m.reorderMu.Lock()
+		for _, rb := range m.reorderBufs {
+			rb.mu.Lock()
+			m.stopGapTimer(rb)
+			rb.broken = true
+			rb.mu.Unlock()
+		}
 		m.reorderBufs = make(map[uint32]*reorderBuf)
 		m.reorderMu.Unlock()
 	}
@@ -212,8 +233,12 @@ func (m *Manager) CloseHelper(shortID byte) int {
 	// Clear reorder buffers for this helper.
 	if m.Reorder {
 		m.reorderMu.Lock()
-		for id := range m.reorderBufs {
+		for id, rb := range m.reorderBufs {
 			if byte(id>>24) == shortID {
+				rb.mu.Lock()
+				m.stopGapTimer(rb)
+				rb.broken = true
+				rb.mu.Unlock()
 				delete(m.reorderBufs, id)
 			}
 		}
@@ -231,10 +256,24 @@ func (m *Manager) CloseHelper(shortID byte) int {
 // the peer and tear the stream down so the application layer can recover.
 const maxReorderPending = 1024
 
+// reorderGapTimeout bounds how long a stream may wait for a single missing
+// frame before we give up. maxReorderPending only fires when >1024 later frames
+// pile up; if just a handful follow the gap, the buffer would otherwise wait
+// forever. This per-stream timer guarantees a stalled stream is reset within a
+// bounded interval so the application layer can recover.
+const reorderGapTimeout = 30 * time.Second
+
 // HandleStreamFrame processes an incoming stream frame with optional reordering.
 // When Reorder is true, frames are buffered and delivered in SeqID order.
 // The handler callback is invoked for each frame in sequence order and may be
 // called multiple times if buffered frames become deliverable.
+//
+// The handler is always invoked WITHOUT rb.mu held. A handler may tear the
+// stream down (FIN/RST -> CloseStream -> Remove -> dropReorderBuf, which locks
+// rb.mu); calling it under rb.mu would self-deadlock the single read loop. Since
+// HandleStreamFrame is only ever driven by that one read loop per manager,
+// collecting the deliverable frames under the lock and dispatching them after
+// unlocking still preserves strict in-order delivery.
 func (m *Manager) HandleStreamFrame(f protocol.Frame, handler func(protocol.Frame)) {
 	if !m.Reorder || f.SeqID == 0 {
 		handler(f)
@@ -251,6 +290,7 @@ func (m *Manager) HandleStreamFrame(f protocol.Frame, handler func(protocol.Fram
 
 	overflow := false
 	var overflowExpected uint32
+	var deliver []protocol.Frame // dispatched in order after rb.mu is released
 	rb.mu.Lock()
 	if rb.broken {
 		// Stream already flagged for reset; drop further frames so the buffer
@@ -259,7 +299,7 @@ func (m *Manager) HandleStreamFrame(f protocol.Frame, handler func(protocol.Fram
 		return
 	}
 	if f.SeqID == rb.expected {
-		handler(f)
+		deliver = append(deliver, f)
 		rb.expected++
 		// Drain consecutive buffered frames.
 		for {
@@ -268,42 +308,113 @@ func (m *Manager) HandleStreamFrame(f protocol.Frame, handler func(protocol.Fram
 				break
 			}
 			delete(rb.pending, rb.expected)
-			handler(next)
+			deliver = append(deliver, next)
 			rb.expected++
 		}
+		// The gap (if any) advanced: stop the timer when fully caught up, else
+		// restart it so the next still-missing frame gets its own deadline.
+		if len(rb.pending) == 0 {
+			m.stopGapTimer(rb)
+		} else {
+			m.armGapTimer(f.StreamID, rb)
+		}
 	} else if f.SeqID > rb.expected {
-		rb.pending[f.SeqID] = f
+		if _, dup := rb.pending[f.SeqID]; !dup {
+			rb.pending[f.SeqID] = f
+		}
 		if len(rb.pending) > maxReorderPending {
 			overflow = true
 			overflowExpected = rb.expected
 			rb.broken = true
-		} else if len(rb.pending)%100 == 0 {
-			log.Printf("[WARN] reorder buffer growing stream=%d pending=%d expected=%d got=%d",
-				f.StreamID, len(rb.pending), rb.expected, f.SeqID)
+			m.stopGapTimer(rb)
+		} else {
+			// First out-of-order frame for the current gap: start the timer so a
+			// single lost frame can't stall the stream forever.
+			if rb.gapTimer == nil {
+				m.armGapTimer(f.StreamID, rb)
+			}
+			if len(rb.pending)%100 == 0 {
+				log.Printf("[WARN] reorder buffer growing stream=%d pending=%d expected=%d got=%d",
+					f.StreamID, len(rb.pending), rb.expected, f.SeqID)
+			}
 		}
 	} else {
 		log.Printf("[WARN] duplicate/old frame stream=%d seq=%d expected=%d", f.StreamID, f.SeqID, rb.expected)
 	}
 	rb.mu.Unlock()
 
+	// Dispatch in order without holding rb.mu (see the doc comment above).
+	for _, df := range deliver {
+		handler(df)
+	}
+
 	if overflow {
 		log.Printf("[ERROR] reorder overflow stream=%d pending>%d expected=%d (lost frame?), resetting stream",
 			f.StreamID, maxReorderPending, overflowExpected)
-		streamID := f.StreamID
-		// Reset off the read-loop goroutine: SendFrame (wsSend) may block, and
-		// stalling here would delay delivery for every other stream. CloseStream
-		// -> Remove also clears this stream's reorder buffer + seq counter.
-		go func() {
-			_ = m.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID})
-			if s := m.Get(streamID); s != nil {
-				m.CloseStream(s)
-			} else {
-				m.reorderMu.Lock()
-				delete(m.reorderBufs, streamID)
-				m.reorderMu.Unlock()
-			}
-		}()
+		m.resetStream(f.StreamID)
 	}
+}
+
+// armGapTimer (re)starts the reorder gap timer for rb. Caller must hold rb.mu.
+// A superseded timer that has already fired is ignored by comparing identity in
+// the callback, so restarting can never trigger a spurious reset.
+func (m *Manager) armGapTimer(streamID uint32, rb *reorderBuf) {
+	if rb.gapTimer != nil {
+		rb.gapTimer.Stop()
+	}
+	var t *time.Timer
+	t = time.AfterFunc(reorderGapTimeout, func() {
+		rb.mu.Lock()
+		if rb.gapTimer != t || rb.broken || len(rb.pending) == 0 {
+			rb.mu.Unlock()
+			return
+		}
+		rb.broken = true
+		rb.gapTimer = nil
+		expected := rb.expected
+		rb.mu.Unlock()
+		log.Printf("[ERROR] reorder gap timeout stream=%d expected=%d (lost frame?), resetting stream", streamID, expected)
+		m.resetStream(streamID)
+	})
+	rb.gapTimer = t
+}
+
+// stopGapTimer cancels rb's gap timer if running. Caller must hold rb.mu.
+func (m *Manager) stopGapTimer(rb *reorderBuf) {
+	if rb.gapTimer != nil {
+		rb.gapTimer.Stop()
+		rb.gapTimer = nil
+	}
+}
+
+// resetStream RSTs the peer and tears the stream down. Runs off the read-loop
+// goroutine because SendFrame (wsSend) may block; stalling there would delay
+// delivery for every other stream.
+func (m *Manager) resetStream(streamID uint32) {
+	go func() {
+		_ = m.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID})
+		if s := m.Get(streamID); s != nil {
+			m.CloseStream(s) // Remove() clears the reorder buffer + seq counter.
+		} else {
+			m.dropReorderBuf(streamID)
+		}
+	}()
+}
+
+// dropReorderBuf stops any gap timer and removes the stream's reorder buffer.
+func (m *Manager) dropReorderBuf(streamID uint32) {
+	if !m.Reorder {
+		return
+	}
+	m.reorderMu.Lock()
+	if rb, ok := m.reorderBufs[streamID]; ok {
+		rb.mu.Lock()
+		m.stopGapTimer(rb)
+		rb.broken = true
+		rb.mu.Unlock()
+		delete(m.reorderBufs, streamID)
+	}
+	m.reorderMu.Unlock()
 }
 
 // ReadLoop reads from TCP and sends DATA frames to the peer.
@@ -332,18 +443,17 @@ func (m *Manager) ReadLoop(s *Stream) {
 		return nil
 	}
 
+	// sendFailed records whether the loop is unwinding because forwarding to
+	// the peer broke (RST) rather than a clean local EOF (FIN).
+	sendFailed := false
+
 	defer func() {
 		if coalesce {
-			_ = flush()
+			if err := flush(); err != nil {
+				sendFailed = true
+			}
 		}
-		s.mu.Lock()
-		wasClosed := s.closed
-		s.mu.Unlock()
-		if !wasClosed {
-			log.Printf("[DEBUG] TCP read ended stream=%d, sending FIN", s.ID)
-			m.SendFrame(protocol.Frame{Type: protocol.MsgFin, StreamID: s.ID})
-			m.CloseStream(s)
-		}
+		m.finishLocalRead(s, sendFailed)
 	}()
 
 	for {
@@ -362,6 +472,7 @@ func (m *Manager) ReadLoop(s *Stream) {
 				// Flush immediately if buffer is large enough
 				if len(coalesceBuf) >= 32*1024 {
 					if flushErr := flush(); flushErr != nil {
+						sendFailed = true
 						return
 					}
 				}
@@ -374,6 +485,7 @@ func (m *Manager) ReadLoop(s *Stream) {
 					Payload:  payload,
 				}); sendErr != nil {
 					log.Printf("[WARN] send DATA failed stream=%d err=%v", s.ID, sendErr)
+					sendFailed = true
 					return
 				}
 			}
@@ -382,12 +494,46 @@ func (m *Manager) ReadLoop(s *Stream) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				// Read deadline expired — flush buffered data and continue
 				if flushErr := flush(); flushErr != nil {
+					sendFailed = true
 					return
 				}
 				continue
 			}
 			return
 		}
+	}
+}
+
+// finishLocalRead is called once the local read side (Conn -> peer) ends. On a
+// clean local EOF it sends FIN and half-closes our read side, leaving the write
+// side open so peer -> local data keeps flowing until the peer FINs. If the
+// loop ended because forwarding to the peer failed, it RSTs instead. The stream
+// is fully closed only when both directions are done (or on RST).
+func (m *Manager) finishLocalRead(s *Stream, forwardingFailed bool) {
+	s.mu.Lock()
+	if s.closed || s.localReadEnded {
+		s.mu.Unlock()
+		return
+	}
+	s.localReadEnded = true
+	remoteDone := s.remoteWriteEnded
+	s.mu.Unlock()
+
+	if forwardingFailed {
+		log.Printf("[DEBUG] forwarding failed stream=%d, sending RST", s.ID)
+		m.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: s.ID})
+		m.CloseStream(s)
+		return
+	}
+
+	log.Printf("[DEBUG] TCP read ended stream=%d, sending FIN", s.ID)
+	m.SendFrame(protocol.Frame{Type: protocol.MsgFin, StreamID: s.ID})
+	if tc, ok := s.Conn.(*net.TCPConn); ok {
+		tc.CloseRead()
+	}
+	if remoteDone {
+		// Peer already FIN'd — both directions done, close fully.
+		m.CloseStream(s)
 	}
 }
 

@@ -80,7 +80,16 @@ func main() {
 		}
 		err := wsClient.Send(peerID, data, "BINARY", token)
 		if err != nil {
-			ups.MarkPeerStale()
+			if wsapi.IsConnectionNotFound(err) {
+				// Definitive: the adapter's connection is gone. Compare-and-clear
+				// against the connID we sent to so a peer that reconnected under a
+				// new connID isn't evicted, then SYNC for a fresh one.
+				ups.MarkPeerStale(peerID)
+			} else {
+				// Transient (timeout, rate limit, server error): keep the peer ID
+				// so a healthy adapter isn't poisoned by a blip.
+				log.Printf("[WARN] transient wsSend error (keeping peer): %v", err)
+			}
 		}
 		return err
 	})

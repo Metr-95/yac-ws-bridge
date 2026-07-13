@@ -101,19 +101,23 @@ func (u *Upstream) SendSync() error {
 	return u.Send(protocol.Encode(protocol.Frame{Type: protocol.MsgSync}))
 }
 
-// MarkPeerStale clears the peer connection ID and triggers a SYNC.
-// Call this when wsSend to the peer fails.
-func (u *Upstream) MarkPeerStale() {
+// MarkPeerStale clears the peer connection ID and triggers a SYNC, but only if
+// the current peer still matches expectedConnID. This compare-and-clear stops a
+// slow/old failed request from evicting a peer that has since reconnected under
+// a new connID. Call this only for a definitive "connection not found" failure.
+func (u *Upstream) MarkPeerStale(expectedConnID string) {
 	u.mu.Lock()
 	old := u.peerConnID
+	if old == "" || (expectedConnID != "" && old != expectedConnID) {
+		u.mu.Unlock()
+		return
+	}
 	u.peerConnID = ""
 	u.staleConnID = old
 	u.mu.Unlock()
-	if old != "" {
-		log.Printf("[WARN] peer connId %s marked stale, sending SYNC", old)
-		if err := u.SendSync(); err != nil {
-			log.Printf("[WARN] SYNC send failed: %v", err)
-		}
+	log.Printf("[WARN] peer connId %s marked stale, sending SYNC", old)
+	if err := u.SendSync(); err != nil {
+		log.Printf("[WARN] SYNC send failed: %v", err)
 	}
 }
 
@@ -194,19 +198,22 @@ func (u *Upstream) HasHelpers() bool {
 	return len(u.helpers) > 0
 }
 
-// MarkHelperStale removes a helper that has stopped responding to wsSend.
-// Returns the removed connID (or "" if none).
-func (u *Upstream) MarkHelperStale(shortID byte) string {
+// MarkHelperStale removes a helper that has stopped responding to wsSend, but
+// only if it still maps to expectedConnID. This compare-and-clear prevents a
+// slow/old failed request from evicting a helper that has since reconnected
+// under a new connID. Call this only for a definitive "connection not found"
+// failure. Returns the removed connID (or "" if nothing was removed).
+func (u *Upstream) MarkHelperStale(shortID byte, expectedConnID string) string {
 	u.mu.Lock()
 	old := u.helpers[shortID]
+	if old == "" || (expectedConnID != "" && old != expectedConnID) {
+		u.mu.Unlock()
+		return ""
+	}
 	delete(u.helpers, shortID)
-	if old != "" {
-		u.helperStale[shortID] = old
-	}
+	u.helperStale[shortID] = old
 	u.mu.Unlock()
-	if old != "" {
-		log.Printf("[WARN] helper shortID=%d connID=%s marked stale", shortID, old)
-	}
+	log.Printf("[WARN] helper shortID=%d connID=%s marked stale", shortID, old)
 	return old
 }
 

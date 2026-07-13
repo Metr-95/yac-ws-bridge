@@ -67,11 +67,21 @@ func main() {
 		}
 		err := wsClient.Send(peerID, data, "BINARY", token)
 		if err != nil {
-			// Drop just this helper; other helpers keep working.
-			ups.MarkHelperStale(shortID)
-			// Close that helper's streams so we don't keep buffering forever.
-			n := sm.CloseHelper(shortID)
-			log.Printf("[WARN] helper shortID=%d wsSend failed, closed %d streams: %v", shortID, n, err)
+			if wsapi.IsConnectionNotFound(err) {
+				// Definitive: this helper's connection is gone. Drop just this
+				// helper (compare-and-clear against the connID we sent to, so a
+				// helper that reconnected under a new connID isn't evicted);
+				// other helpers keep working.
+				if old := ups.MarkHelperStale(shortID, peerID); old != "" {
+					n := sm.CloseHelper(shortID)
+					log.Printf("[WARN] helper shortID=%d gone (connId=%s not found), closed %d streams: %v", shortID, old, n, err)
+				}
+			} else {
+				// Transient (timeout, rate limit, server error): keep the helper
+				// ID so a healthy peer isn't poisoned by a blip. The affected
+				// stream still sees the error and recovers on its own.
+				log.Printf("[WARN] helper shortID=%d transient wsSend error (keeping peer): %v", shortID, err)
+			}
 		}
 		return err
 	})
