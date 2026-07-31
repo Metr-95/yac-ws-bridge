@@ -1,6 +1,27 @@
 # Bridge to Freedom — Client app
 
-Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the **helper** — listens on a local TCP port and tunnels connections to the adapter through YC.
+Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the
+**Helper** — listens on a local TCP port and relays every connection through
+an S3-compatible object storage bucket to a
+[deaddrop-server](https://github.com/) on the far side (e.g. on a VPS),
+which dials the real target (an SSH server, an MTProto proxy, a VLESS/Reality
+endpoint, anything TCP).
+
+This is a from-scratch C#/MAUI port of
+[deaddrop](../deaddrop)'s `cmd/client` — same wire protocol
+(`internal/store` SigV4-signed S3 calls, `internal/tunnel`'s store-and-forward
+session/chunk layout), same zero-external-dependency philosophy (no AWS SDK,
+just `System.Net.Http` + `System.Security.Cryptography`). The two
+implementations are interoperable: this Helper talks to a deaddrop-server
+built from the Go source, and vice versa.
+
+> **Why not the earlier WebSocket-bridge design?** An earlier version of this
+> app tunnelled through a Yandex API Gateway WebSocket + Cloud Function
+> relay. Live testing during an actual mobile "white-list mode" shutdown
+> found API Gateway and Cloud Functions both **unreachable** — only managed
+> Object Storage stayed on the allow-list. See the [deaddrop
+> README](../deaddrop/README.md#why-this-exists) for the full story and the
+> reachability matrix that drove this rewrite.
 
 
 ## Supported platforms
@@ -21,7 +42,7 @@ Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the **he
 
 ## Important
 
-If you use a proxy client that works as a TUN, you must add an exclusion for the helper process, otherwise you'll get an infinite loop and nothing will work. On connect, the app logs endpoint domains and IP addresses — you can add those to exclusions if per-process exclusions aren't available. That said, in the Happ client it didn't work for me even with that (but it works fine without TUN, e.g. for Telegram).
+If you use a proxy client that works as a TUN, you must add an exclusion for the helper process, otherwise you'll get an infinite loop and nothing will work. That said, in the Happ client it didn't work for me even with that (but it works fine without TUN, e.g. for Telegram).
 
 ## Build
 
@@ -75,25 +96,40 @@ Install the GTK4 / libadwaita / WebKitGTK runtime libs (the GTK4 backend P/Invok
 
 ## Usage
 
-1. Enter **Bridge URL** — the helper endpoint of the API Gateway (e.g. `wss://gateway.example.com/_helper`)
-2. Enter **Auth Token** — the shared secret matching the adapter and Cloud Function
-3. Set **Listen Address** and **Port** — where clients should connect (default `127.123.45.67:5080`). If you want to share the tunnel with other devices on your local network, change the address to `0.0.0.0` manually so the listener binds on all interfaces.
-4. If your device cannot reach the `wsSend` API directly, enable **Relay mode**. Recommendation: don't enable relay mode unless you have to — only use it if direct mode doesn't work for you. Direct mode is faster and more stable.
+1. Enter **Endpoint** — the S3-compatible API base URL (e.g. `https://storage.yandexcloud.net`)
+2. Enter **Region** and **Prefix** — defaults (`ru-central1` / `deaddrop`) match deaddrop's own config defaults; only change these if the server side was configured differently
+3. Enter **Bucket**, **Access Key ID**, **Secret Access Key** — a scoped static key for the bucket (see the [deaddrop README](../deaddrop/README.md#security-notes--known-limitations) — use a dedicated, write-`c2s`/read-`s2c` credential, not your main account key, since this device is the one most likely to be lost/seized)
+4. Set **Listen Address** and **Port** — where the local app (Shadowrocket, curl, anything) should connect (default `127.123.45.67:1080`). If you want to share the tunnel with other devices on your local network, change the address to `0.0.0.0` manually so the listener binds on all interfaces.
 5. Press **CONNECT**
+
+On connect, the app automatically round-trips a small test object through the bucket (PUT + GET + DELETE) and shows the result as a status pill — a quick way to confirm the endpoint/region/bucket/credentials are actually right before routing real traffic through it.
 
 The app keeps the tunnel running in the background:
 - **Android**: foreground service with a wake lock
-- **iOS**: `beginBackgroundTask` + `BGProcessingTask`
+- **iOS**: `beginBackgroundTask` + `BGProcessingTask`, optionally backed by a silent-audio loop (`IOS_BACKGROUND_AUDIO`, see the csproj) for longer-lived background survival on a free (non-Developer-Program) signing identity
 
 Press **DISCONNECT** to stop.
 
-Settings are saved automatically and restored on next launch; they can also be imported/exported as a URL.
+Settings — including the secret key — are saved automatically and restored on next launch; they can also be imported/exported as a `dd://config?...` URL via the clipboard.
 
-## Recommended setup for Android (proven stable)
+## Recommended iOS setup (no NetworkExtension entitlement required)
 
-The combination below has proven both effective and stable:
+Apple's Personal VPN / NetworkExtension entitlement requires a paid Apple
+Developer Program membership; a free "Personal Team" signing identity
+(AltStore/SideStore-style sideloading) can't get it. This Helper works
+around that by never trying to be a system VPN — it just runs a local TCP
+listener that another already-App-Store-signed app can point at:
 
-- On the phone: install this app (BTF) and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (e.g. Chrome and Telegram only — important so v2rayNG does NOT try to route BTF's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to `127.123.45.67:5080`. Start BTF first and connect to the server, then enable v2rayNG.
-- On the adapter side (VPS): run Dante (SOCKS) or XRay (VLESS) listening on whatever address the adapter forwards to (i.e. the adapter's `target.address`). The adapter delivers each incoming TCP stream to it and the proxy then exits to the open internet.
+- Install [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118) (a one-time paid App Store app, so it already has the NetworkExtension entitlement) and this Helper (sideloaded via AltStore/SideStore, since it needs no special entitlements — it's a plain foreground/background app with a TCP listener).
+- Configure this Helper with your bucket/keys and press **CONNECT**.
+- In Shadowrocket, add an upstream SOCKS/proxy entry pointing at this Helper's `Listen Address:Port` (default `127.123.45.67:1080`), and route Shadowrocket's outbound traffic through it.
+- On the server side (the VPS), run `deaddrop-server` with `target` pointing at whatever real proxy is listening there (Xray/VLESS+Reality, an SSH SOCKS tunnel, etc.) — see the [deaddrop README](../deaddrop/README.md).
 
-Flow: `app → v2rayNG (per-app) → BTF helper :5080 → YC → BTF adapter → Dante/XRay → internet`.
+Flow: `apps on phone → Shadowrocket (VPN entitlement) → this Helper :1080 → bucket → deaddrop-server → real proxy → internet`.
+
+## Recommended setup for Android (proven stable, same idea)
+
+- On the phone: install this app and [v2rayNG](https://github.com/2dust/v2rayNG). In v2rayNG, enable per-app proxying and pick the apps you actually want to route through the tunnel (important so v2rayNG does NOT try to route this Helper's own upstream traffic, which would cause a loop). Create a new outbound profile of type SOCKS (or VLESS) and point it to this Helper's listen address/port. Start this Helper first and connect, then enable v2rayNG.
+- On the server side (VPS): run `deaddrop-server` with `target` pointing at Dante (SOCKS) or XRay (VLESS), listening locally on the VPS. `deaddrop-server` delivers each session's bytes to it and the proxy exits to the open internet.
+
+Flow: `app → v2rayNG (per-app) → Helper :1080 → bucket → deaddrop-server → Dante/XRay → internet`.

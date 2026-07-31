@@ -21,12 +21,14 @@ public partial class MainPage : ContentPage
         _tunnel.OnProbeStatusChanged += OnProbeStatusChanged;
 
         // Load saved settings
-        BridgeUrlEntry.Text = Preferences.Default.Get("BridgeUrl", "wss://");
-        AuthTokenEntry.Text = Preferences.Default.Get("AuthToken", "");
+        EndpointEntry.Text = Preferences.Default.Get("Endpoint", "https://storage.yandexcloud.net");
+        RegionEntry.Text = Preferences.Default.Get("Region", "ru-central1");
+        PrefixEntry.Text = Preferences.Default.Get("Prefix", "deaddrop");
+        BucketEntry.Text = Preferences.Default.Get("Bucket", "");
+        AccessKeyIdEntry.Text = Preferences.Default.Get("AccessKeyId", "");
+        SecretAccessKeyEntry.Text = Preferences.Default.Get("SecretAccessKey", "");
         ListenAddressEntry.Text = Preferences.Default.Get("ListenAddress", "127.123.45.67");
-        ListenPortEntry.Text = Preferences.Default.Get("ListenPort", "5080");
-        RelaySwitch.IsToggled = Preferences.Default.Get("Relay", false);
-        CoalesceSwitch.IsToggled = Preferences.Default.Get("WriteCoalescing", false);
+        ListenPortEntry.Text = Preferences.Default.Get("ListenPort", "1080");
 
         // Restore UI state if tunnel is already running (e.g. after activity recreate from background)
         if (_tunnel.IsRunning)
@@ -44,24 +46,18 @@ public partial class MainPage : ContentPage
     {
         try
         {
-            var url = BridgeUrlEntry.Text?.Trim() ?? "";
-            if (!url.StartsWith("wss://"))
-            {
-                await DisplayAlertAsync("Error", "Bridge URL must start with wss://", "OK");
-                return;
-            }
-
-            // btf://host/path?token=X&listen=addr:port&relay=1
-            var bridgeUri = new Uri(url);
             var qs = HttpUtility.ParseQueryString("");
-            qs["token"] = AuthTokenEntry.Text?.Trim() ?? "";
+            qs["endpoint"] = EndpointEntry.Text?.Trim() ?? "";
+            qs["region"] = RegionEntry.Text?.Trim() ?? "";
+            qs["prefix"] = PrefixEntry.Text?.Trim() ?? "";
+            qs["bucket"] = BucketEntry.Text?.Trim() ?? "";
+            qs["ak"] = AccessKeyIdEntry.Text?.Trim() ?? "";
+            qs["sk"] = SecretAccessKeyEntry.Text?.Trim() ?? "";
             qs["listen"] = $"{ListenAddressEntry.Text?.Trim()}:{ListenPortEntry.Text?.Trim()}";
-            if (RelaySwitch.IsToggled) qs["relay"] = "1";
-            if (CoalesceSwitch.IsToggled) qs["coalesce"] = "1";
 
-            var btfUrl = $"btf://{bridgeUri.Host}{bridgeUri.AbsolutePath}?{qs}";
-            await Clipboard.Default.SetTextAsync(btfUrl);
-            AddLog($"Config exported to clipboard");
+            var ddUrl = $"dd://config?{qs}";
+            await Clipboard.Default.SetTextAsync(ddUrl);
+            AddLog("Config exported to clipboard");
         }
         catch (Exception ex)
         {
@@ -74,18 +70,21 @@ public partial class MainPage : ContentPage
         try
         {
             var text = await Clipboard.Default.GetTextAsync();
-            if (string.IsNullOrWhiteSpace(text) || !text.StartsWith("btf://"))
+            if (string.IsNullOrWhiteSpace(text) || !text.StartsWith("dd://"))
             {
-                await DisplayAlertAsync("Import", "No btf:// URL found in clipboard", "OK");
+                await DisplayAlertAsync("Import", "No dd:// config found in clipboard", "OK");
                 return;
             }
 
-            // btf://host/path?token=X&listen=addr:port&relay=1  ->  wss://host/path
             var uri = new Uri(text);
             var qs = HttpUtility.ParseQueryString(uri.Query);
 
-            BridgeUrlEntry.Text = $"wss://{uri.Host}{uri.AbsolutePath}";
-            AuthTokenEntry.Text = qs["token"] ?? "";
+            EndpointEntry.Text = qs["endpoint"] ?? EndpointEntry.Text;
+            RegionEntry.Text = qs["region"] ?? RegionEntry.Text;
+            PrefixEntry.Text = qs["prefix"] ?? PrefixEntry.Text;
+            BucketEntry.Text = qs["bucket"] ?? "";
+            AccessKeyIdEntry.Text = qs["ak"] ?? "";
+            SecretAccessKeyEntry.Text = qs["sk"] ?? "";
 
             var listen = qs["listen"] ?? "";
             var colonIdx = listen.LastIndexOf(':');
@@ -95,8 +94,6 @@ public partial class MainPage : ContentPage
                 ListenPortEntry.Text = listen[(colonIdx + 1)..];
             }
 
-            RelaySwitch.IsToggled = qs["relay"] == "1";
-            CoalesceSwitch.IsToggled = qs["coalesce"] == "1";
             AddLog("Config imported from clipboard");
         }
         catch (Exception ex)
@@ -109,7 +106,6 @@ public partial class MainPage : ContentPage
     {
         if (_isRunning)
         {
-            // Stop — this triggers OnDestroy in the service which calls Tunnel.Stop()
             StopPlatformService();
             _tunnel.Stop();
             _isRunning = false;
@@ -121,19 +117,28 @@ public partial class MainPage : ContentPage
         }
 
         // Validate
-        var url = BridgeUrlEntry.Text?.Trim();
-        var token = AuthTokenEntry.Text?.Trim();
+        var endpoint = EndpointEntry.Text?.Trim();
+        var region = RegionEntry.Text?.Trim();
+        var prefix = PrefixEntry.Text?.Trim();
+        var bucket = BucketEntry.Text?.Trim();
+        var accessKeyId = AccessKeyIdEntry.Text?.Trim();
+        var secretAccessKey = SecretAccessKeyEntry.Text?.Trim();
         var addr = ListenAddressEntry.Text?.Trim();
         var portStr = ListenPortEntry.Text?.Trim();
 
-        if (string.IsNullOrEmpty(url) || !url.StartsWith("wss://"))
+        if (string.IsNullOrEmpty(endpoint) || !(endpoint.StartsWith("http://") || endpoint.StartsWith("https://")))
         {
-            await DisplayAlertAsync("Error", "Bridge URL must start with wss://", "OK");
+            await DisplayAlertAsync("Error", "Endpoint must start with http:// or https://", "OK");
             return;
         }
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrEmpty(bucket))
         {
-            await DisplayAlertAsync("Error", "Auth token is required", "OK");
+            await DisplayAlertAsync("Error", "Bucket is required", "OK");
+            return;
+        }
+        if (string.IsNullOrEmpty(accessKeyId) || string.IsNullOrEmpty(secretAccessKey))
+        {
+            await DisplayAlertAsync("Error", "Access Key ID and Secret Access Key are required", "OK");
             return;
         }
         if (!int.TryParse(portStr, out var port) || port < 1 || port > 65535)
@@ -142,20 +147,25 @@ public partial class MainPage : ContentPage
             return;
         }
 
-        _tunnel.BridgeUrl = url;
-        _tunnel.AuthToken = token;
+        _tunnel.Endpoint = endpoint;
+        _tunnel.Region = string.IsNullOrEmpty(region) ? "ru-central1" : region;
+        _tunnel.Prefix = string.IsNullOrEmpty(prefix) ? "deaddrop" : prefix;
+        _tunnel.Bucket = bucket;
+        _tunnel.AccessKeyId = accessKeyId;
+        _tunnel.SecretAccessKey = secretAccessKey;
         _tunnel.ListenAddress = addr ?? "127.123.45.67";
         _tunnel.ListenPort = port;
-        _tunnel.Relay = RelaySwitch.IsToggled;
-        _tunnel.WriteCoalescing = CoalesceSwitch.IsToggled;
 
-        // Save settings
-        Preferences.Default.Set("BridgeUrl", url);
-        Preferences.Default.Set("AuthToken", token);
-        Preferences.Default.Set("ListenAddress", addr ?? "127.123.45.67");
+        // Save settings (secret key included — this device is the whole
+        // point of the app, same trust boundary as the rest of the config).
+        Preferences.Default.Set("Endpoint", endpoint);
+        Preferences.Default.Set("Region", _tunnel.Region);
+        Preferences.Default.Set("Prefix", _tunnel.Prefix);
+        Preferences.Default.Set("Bucket", bucket);
+        Preferences.Default.Set("AccessKeyId", accessKeyId);
+        Preferences.Default.Set("SecretAccessKey", secretAccessKey);
+        Preferences.Default.Set("ListenAddress", _tunnel.ListenAddress);
         Preferences.Default.Set("ListenPort", portStr!);
-        Preferences.Default.Set("Relay", RelaySwitch.IsToggled);
-        Preferences.Default.Set("WriteCoalescing", CoalesceSwitch.IsToggled);
 
         _isRunning = true;
         ConnectButton.Text = "DISCONNECT";
@@ -199,10 +209,6 @@ public partial class MainPage : ContentPage
     /// </summary>
     private void OnProbeStatusChanged(ProbeStatus status, string detail)
     {
-        // Diagnostic: confirm we actually receive the event (we have seen
-        // cases where the probe runs but the UI doesn't update).
-        Dispatcher.Dispatch(() => AddLog($"[ui] probe status -> {status}: {detail}"));
-
         Dispatcher.Dispatch(() =>
         {
             switch (status)
@@ -216,8 +222,8 @@ public partial class MainPage : ContentPage
                     ProbeStatusBorder.BackgroundColor = Color.FromArgb("#FFF3CD"); // amber
                     ProbeStatusIcon.TextColor   = Color.FromArgb("#856404");
                     ProbeStatusLabel.TextColor  = Color.FromArgb("#856404");
-                    ProbeStatusIcon.Text  = "⧗"; // hourglass-ish dot
-                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Testing connection..." : detail;
+                    ProbeStatusIcon.Text  = "⧗";
+                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Testing bucket connectivity..." : detail;
                     return;
 
                 case ProbeStatus.Ok:
@@ -226,7 +232,7 @@ public partial class MainPage : ContentPage
                     ProbeStatusIcon.TextColor   = Color.FromArgb("#FFFFFF");
                     ProbeStatusLabel.TextColor  = Color.FromArgb("#FFFFFF");
                     ProbeStatusIcon.Text  = "✓";
-                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Connection verified" : detail;
+                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Bucket reachable" : detail;
                     return;
 
                 case ProbeStatus.Failed:
@@ -235,7 +241,7 @@ public partial class MainPage : ContentPage
                     ProbeStatusIcon.TextColor   = Color.FromArgb("#721C24");
                     ProbeStatusLabel.TextColor  = Color.FromArgb("#721C24");
                     ProbeStatusIcon.Text  = "✕";
-                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Connection test failed" : detail;
+                    ProbeStatusLabel.Text = string.IsNullOrEmpty(detail) ? "Bucket connectivity test failed" : detail;
                     return;
             }
         });
@@ -266,7 +272,8 @@ public partial class MainPage : ContentPage
         context.StartForegroundService(intent);
 #else
         // iOS, macOS, Windows: run the tunnel in a background task.
-        // iOS stays alive via beginBackgroundTask + BGProcessingTask in AppDelegate.
+        // iOS stays alive via beginBackgroundTask + BGProcessingTask + silent
+        // audio (AppDelegate.cs / SilentAudioService.cs).
         _ = Task.Run(async () =>
         {
             try { await _tunnel.StartAsync(); }

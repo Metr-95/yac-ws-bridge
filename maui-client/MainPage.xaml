@@ -5,7 +5,8 @@
     x:Class="BridgeToFreedom.MainPage"
     Title="Bridge to Freedom">
 
-    <Grid RowDefinitions="Auto,*" Padding="16" RowSpacing="12">
+    <ScrollView>
+    <Grid RowDefinitions="Auto,Auto" Padding="16" RowSpacing="12">
 
         <!-- Settings Card -->
         <Border Grid.Row="0" StrokeShape="RoundRectangle 12" StrokeThickness="1"
@@ -15,7 +16,7 @@
             <VerticalStackLayout Spacing="12">
 
                 <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
-                    <Label Text="Connection Settings" FontSize="18" FontAttributes="Bold" VerticalOptions="Center" />
+                    <Label Text="Bucket Settings" FontSize="18" FontAttributes="Bold" VerticalOptions="Center" />
                     <Button Grid.Column="1" Text="Import" FontSize="12" Padding="12,4"
                             HeightRequest="32"
                             Clicked="OnImportClicked"
@@ -28,23 +29,58 @@
                             TextColor="{AppThemeBinding Light=#512BD4, Dark=#C8B8F0}" />
                 </Grid>
 
-                <!-- Bridge URL -->
+                <!-- Endpoint -->
                 <VerticalStackLayout Spacing="4">
-                    <Label Text="Bridge URL" FontSize="12"
+                    <Label Text="Endpoint" FontSize="12"
                            TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
-                    <Entry x:Name="BridgeUrlEntry"
-                           Text="wss://"
-                           Placeholder="wss://gateway.example.com/_helper"
+                    <Entry x:Name="EndpointEntry"
+                           Text="https://storage.yandexcloud.net"
                            Keyboard="Url"
                            IsEnabled="{Binding IsNotRunning}" />
                 </VerticalStackLayout>
 
-                <!-- Auth Token -->
+                <!-- Region + Prefix -->
+                <Grid ColumnDefinitions="*,*" ColumnSpacing="8">
+                    <VerticalStackLayout Spacing="4">
+                        <Label Text="Region" FontSize="12"
+                               TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                        <Entry x:Name="RegionEntry"
+                               Text="ru-central1"
+                               IsEnabled="{Binding IsNotRunning}" />
+                    </VerticalStackLayout>
+                    <VerticalStackLayout Grid.Column="1" Spacing="4">
+                        <Label Text="Prefix" FontSize="12"
+                               TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                        <Entry x:Name="PrefixEntry"
+                               Text="deaddrop"
+                               IsEnabled="{Binding IsNotRunning}" />
+                    </VerticalStackLayout>
+                </Grid>
+
+                <!-- Bucket -->
                 <VerticalStackLayout Spacing="4">
-                    <Label Text="Auth Token" FontSize="12"
+                    <Label Text="Bucket" FontSize="12"
                            TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
-                    <Entry x:Name="AuthTokenEntry"
-                           Placeholder="shared secret"
+                    <Entry x:Name="BucketEntry"
+                           Placeholder="your-bucket-name"
+                           IsEnabled="{Binding IsNotRunning}" />
+                </VerticalStackLayout>
+
+                <!-- Access Key ID -->
+                <VerticalStackLayout Spacing="4">
+                    <Label Text="Access Key ID" FontSize="12"
+                           TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                    <Entry x:Name="AccessKeyIdEntry"
+                           Placeholder="YC..."
+                           IsEnabled="{Binding IsNotRunning}" />
+                </VerticalStackLayout>
+
+                <!-- Secret Access Key -->
+                <VerticalStackLayout Spacing="4">
+                    <Label Text="Secret Access Key" FontSize="12"
+                           TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                    <Entry x:Name="SecretAccessKeyEntry"
+                           Placeholder="secret key"
                            IsPassword="True"
                            IsEnabled="{Binding IsNotRunning}" />
                 </VerticalStackLayout>
@@ -68,21 +104,8 @@
                     </VerticalStackLayout>
                 </Grid>
 
-                <!-- Relay toggle -->
-                <Grid ColumnDefinitions="*,Auto">
-                    <Label Text="Relay mode (send via Cloud Function)"
-                           VerticalOptions="Center" FontSize="13" />
-                    <Switch x:Name="RelaySwitch" Grid.Column="1"
-                            IsEnabled="{Binding IsNotRunning}" />
-                </Grid>
-
-                <!-- Write coalescing toggle -->
-                <Grid ColumnDefinitions="*,Auto">
-                    <Label Text="Write coalescing (Nagle-like, 50ms)"
-                           VerticalOptions="Center" FontSize="13" />
-                    <Switch x:Name="CoalesceSwitch" Grid.Column="1"
-                            IsEnabled="{Binding IsNotRunning}" />
-                </Grid>
+                <Label Text="Point Shadowrocket's upstream SOCKS/proxy at this address and port instead of the real server."
+                       FontSize="11" TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
 
                 <!-- Connect / Disconnect Button -->
                 <Button x:Name="ConnectButton"
@@ -93,9 +116,9 @@
                         BackgroundColor="{AppThemeBinding Light=#512BD4, Dark=#7B5FD4}"
                         TextColor="White" />
 
-                <!-- Probe status indicator: shows the result of the end-to-end
-                     wsApi connectivity probe (helper→cloud→adapter→helper).
-                     Hidden when idle; colored pill while testing / on result. -->
+                <!-- Probe status indicator: shows the result of the automatic
+                     bucket round-trip self-test (PUT+GET+DELETE of a small
+                     object). Hidden when idle; colored pill while testing / on result. -->
                 <Border x:Name="ProbeStatusBorder"
                         IsVisible="False"
                         StrokeShape="RoundRectangle 8"
@@ -125,7 +148,8 @@
         <Border Grid.Row="1" StrokeShape="RoundRectangle 12" StrokeThickness="1"
                 Stroke="{AppThemeBinding Light=#E0E0E0, Dark=#333333}"
                 Background="{AppThemeBinding Light=#F8F8F8, Dark=#111111}"
-                Padding="0">
+                Padding="0"
+                HeightRequest="260">
             <Grid RowDefinitions="Auto,*">
                 <Border Grid.Row="0" StrokeThickness="0" Padding="12,8"
                         Background="{AppThemeBinding Light=#EEEEEE, Dark=#222222}">
@@ -143,4 +167,5 @@
             </Grid>
         </Border>
     </Grid>
+    </ScrollView>
 </ContentPage>
