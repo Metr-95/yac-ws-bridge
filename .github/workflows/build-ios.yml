@@ -36,14 +36,22 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      # Diagnostic: list every Xcode actually installed on this runner image
+      # (stable AND beta) so we know what's really available rather than
+      # guessing — the .NET for iOS workload pack wants a specific Xcode
+      # version that "latest-stable" alone may not reach.
+      - name: List installed Xcode versions
+        run: ls -1 /Applications | grep -i xcode
+
       # The .NET for iOS workload matching .NET 10 targets a recent iOS SDK
       # and needs a matching-enough Xcode — newer than what some macOS runner
-      # images select by default. Pin explicitly to whatever "latest-stable"
-      # resolves to on this runner instead of trusting the default.
+      # images select by default. "latest" (not "latest-stable") also
+      # considers betas, which is often where a very new required version
+      # actually lives on a GitHub-hosted image.
       - name: Select latest available Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: latest
 
       - name: Install MAUI iOS workload
         run: dotnet workload install maui-ios
