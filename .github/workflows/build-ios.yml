@@ -17,8 +17,12 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Install MAUI workload
-        run: dotnet workload install maui
+      # The full "maui" meta-workload pulls in iOS/macCatalyst, which only
+      # install on macOS. maui-tizen is the one platform workload that does
+      # install on Linux, and it's the one the SDK's workload resolver
+      # actually asks for when building the bare (non-suffixed) net10.0 TFM.
+      - name: Install MAUI workload (Linux-installable subset)
+        run: dotnet workload install maui-tizen
 
       - name: Build net10.0 (compile-only sanity check, no platform SDKs needed)
         run: dotnet build maui-client/BridgeToFreedom.csproj -f net10.0
@@ -35,8 +39,10 @@ jobs:
       - name: Install MAUI iOS workload
         run: dotnet workload install maui-ios
 
-      - name: Restore
-        run: dotnet restore maui-client/BridgeToFreedom.csproj -f net10.0-ios
+      # No separate restore step: unlike `dotnet build`, `dotnet restore`
+      # doesn't have a -f/--framework flag — passing one gets parsed as a
+      # second positional project argument ("Only one project can be
+      # specified"). `dotnet build` below restores for the right TFM itself.
 
       # Builds for a real device (ios-arm64), with codesigning disabled — we
       # don't have a paid Apple Developer account to sign with in CI.
