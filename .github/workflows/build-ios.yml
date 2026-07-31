@@ -32,9 +32,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to the exact .NET 10 GA release, not a floating '10.0.x' —
+      # the latest 10.0.302 patch bundles an iOS workload pack calibrated
+      # against iOS SDK 26.5, which demands Xcode 26.6 (not yet on this
+      # runner, confirmed max is 26.3). An earlier SDK patch's default
+      # workload pack should target an earlier iOS SDK Xcode 26.3 already covers.
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.100'
 
       # Diagnostic: list every Xcode actually installed on this runner image
       # (stable AND beta) so we know what's really available rather than
