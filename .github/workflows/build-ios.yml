@@ -1,0 +1,68 @@
+name: Build iOS (unsigned, for AltStore sideload)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Fast, cheap, isolated sanity check that the ported C# actually compiles —
+  # runs on a free ubuntu-latest runner (a few minutes), not on the
+  # production AWS box, and not on scarce macOS minutes. Run this first;
+  # only kick off build-ios once this is green.
+  build-linux-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui
+
+      - name: Build net10.0 (compile-only sanity check, no platform SDKs needed)
+        run: dotnet build maui-client/BridgeToFreedom.csproj -f net10.0
+
+  build-ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install MAUI iOS workload
+        run: dotnet workload install maui-ios
+
+      - name: Restore
+        run: dotnet restore maui-client/BridgeToFreedom.csproj -f net10.0-ios
+
+      # Builds for a real device (ios-arm64), with codesigning disabled — we
+      # don't have a paid Apple Developer account to sign with in CI.
+      # AltServer re-signs the .ipa itself using your free Apple ID at
+      # install time, so it does not need to arrive here already signed.
+      - name: Build unsigned .app/.ipa for device (ios-arm64)
+        run: |
+          dotnet build maui-client/BridgeToFreedom.csproj \
+            -f net10.0-ios -c Release \
+            -p:RuntimeIdentifier=ios-arm64 \
+            -p:ArchiveOnBuild=true \
+            -p:BuildIpa=true \
+            -p:CodesignKey="" \
+            -p:CodesignProvision="" \
+            -p:_RequireCodeSigning=false \
+            -p:EnableCodeSigning=false
+
+      - name: List build output (debugging aid)
+        if: always()
+        run: find maui-client/bin -iname "*.ipa" -o -iname "*.app" -o -iname "*.xcarchive" | tee found.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: BridgeToFreedom-ios-unsigned
+          path: |
+            maui-client/bin/**/*.ipa
+            maui-client/bin/**/*.app
+          if-no-files-found: warn
