@@ -48,10 +48,18 @@ jobs:
       # don't have a paid Apple Developer account to sign with in CI.
       # AltServer re-signs the .ipa itself using your free Apple ID at
       # install time, so it does not need to arrive here already signed.
+      #
+      # -p:TargetFrameworks=net10.0-ios (not just -f) is required: the
+      # csproj's conditions add net10.0-android/-windows/-maccatalyst too on
+      # any non-Linux OS, and `dotnet restore` always restores every TFM in
+      # the project regardless of -f (-f only picks which one to build
+      # afterwards) — so without overriding the property outright, restore
+      # fails demanding the Android workload too, which this job never installs.
       - name: Build unsigned .app/.ipa for device (ios-arm64)
         run: |
           dotnet build maui-client/BridgeToFreedom.csproj \
-            -f net10.0-ios -c Release \
+            -c Release \
+            -p:TargetFrameworks=net10.0-ios \
             -p:RuntimeIdentifier=ios-arm64 \
             -p:ArchiveOnBuild=true \
             -p:BuildIpa=true \
