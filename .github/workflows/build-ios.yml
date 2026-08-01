@@ -28,18 +28,20 @@ jobs:
         run: dotnet build maui-client/BridgeToFreedom.csproj -f net10.0
 
   build-ios:
-    runs-on: macos-15
+    # Tried pinning an older .NET SDK patch first — didn't help, because
+    # `dotnet workload install` always pulls the newest workload pack from
+    # NuGet regardless of SDK patch version. Trying a newer runner image
+    # instead, in case GitHub has one with Xcode 26.6 already (Apple's
+    # year-based versioning means the image might be named macos-26 rather
+    # than macos-15/16). If this label doesn't exist, the job fails fast at
+    # queue time rather than burning build minutes.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to the exact .NET 10 GA release, not a floating '10.0.x' —
-      # the latest 10.0.302 patch bundles an iOS workload pack calibrated
-      # against iOS SDK 26.5, which demands Xcode 26.6 (not yet on this
-      # runner, confirmed max is 26.3). An earlier SDK patch's default
-      # workload pack should target an earlier iOS SDK Xcode 26.3 already covers.
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.100'
+          dotnet-version: '10.0.x'
 
       # Diagnostic: list every Xcode actually installed on this runner image
       # (stable AND beta) so we know what's really available rather than
