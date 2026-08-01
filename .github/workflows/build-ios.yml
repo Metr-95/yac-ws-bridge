@@ -63,15 +63,40 @@ jobs:
       - name: Install MAUI iOS workload
         run: dotnet workload install maui-ios
 
+      # A real device (arm64) binary structurally needs SOME code signature
+      # to be a valid Mach-O — but it does NOT need to be an Apple-issued
+      # identity for our purposes: AltServer strips and re-signs everything
+      # itself at install time using your free Apple ID, exactly like it
+      # already did when it installed AltStore itself. So we generate a
+      # throwaway, purely local self-signed certificate here — no real
+      # Apple account, no secrets, nothing that leaves this runner.
+      - name: Create throwaway self-signed codesigning identity
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          EXISTING=$(security list-keychains -d user | sed 's/"//g')
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+
+          CERT_NAME="BTF Sideload Adhoc"
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
+            -subj "/CN=$CERT_NAME" \
+            -addext "extendedKeyUsage=codeSigning" \
+            -addext "keyUsage=digitalSignature"
+          openssl pkcs12 -export -out cert.p12 -inkey key.pem -in cert.pem -passout pass:temppass
+
+          security import cert.p12 -k "$KEYCHAIN" -P temppass -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "CODESIGN_IDENTITY=$CERT_NAME" >> "$GITHUB_ENV"
+
       # No separate restore step: unlike `dotnet build`, `dotnet restore`
       # doesn't have a -f/--framework flag — passing one gets parsed as a
       # second positional project argument ("Only one project can be
       # specified"). `dotnet build` below restores for the right TFM itself.
-
-      # Builds for a real device (ios-arm64), with codesigning disabled — we
-      # don't have a paid Apple Developer account to sign with in CI.
-      # AltServer re-signs the .ipa itself using your free Apple ID at
-      # install time, so it does not need to arrive here already signed.
       #
       # -p:TargetFrameworks=net10.0-ios (not just -f) is required: the
       # csproj's conditions add net10.0-android/-windows/-maccatalyst too on
@@ -79,28 +104,46 @@ jobs:
       # the project regardless of -f (-f only picks which one to build
       # afterwards) — so without overriding the property outright, restore
       # fails demanding the Android workload too, which this job never installs.
-      - name: Build unsigned .app/.ipa for device (ios-arm64)
+      #
+      # Deliberately NOT passing ArchiveOnBuild/BuildIpa: creating a full
+      # Xcode .xcarchive hard-requires a "real" (Apple-chain-validated)
+      # signing identity + provisioning profile, which a self-signed
+      # certificate can't satisfy. A plain device build only needs the
+      # binary to carry *a* signature to be valid Mach-O — codesign itself
+      # doesn't validate the certificate's trust chain. We zip the .app into
+      # an .ipa by hand afterwards (an .ipa is just a zip of Payload/*.app).
+      - name: Build .app for device (ios-arm64), self-signed
         run: |
           dotnet build maui-client/BridgeToFreedom.csproj \
             -c Release \
             -p:TargetFrameworks=net10.0-ios \
             -p:RuntimeIdentifier=ios-arm64 \
-            -p:ArchiveOnBuild=true \
-            -p:BuildIpa=true \
-            -p:CodesignKey="" \
-            -p:CodesignProvision="" \
-            -p:_RequireCodeSigning=false \
-            -p:EnableCodeSigning=false
+            -p:CodesignKey="$CODESIGN_IDENTITY"
+
+      - name: Package .app into a sideload-able .ipa (Payload/*.app zip)
+        if: always()
+        run: |
+          set -euo pipefail
+          APP_DIR=$(find maui-client/bin -type d -iname "*.app" | head -n1)
+          if [ -z "$APP_DIR" ]; then
+            echo "No .app bundle found — build likely failed before producing output."
+            exit 0
+          fi
+          echo "Found: $APP_DIR"
+          mkdir -p ipa_root/Payload
+          cp -R "$APP_DIR" ipa_root/Payload/
+          (cd ipa_root && zip -qr ../BridgeToFreedom-unsigned.ipa Payload)
+          ls -la BridgeToFreedom-unsigned.ipa
 
       - name: List build output (debugging aid)
         if: always()
-        run: find maui-client/bin -iname "*.ipa" -o -iname "*.app" -o -iname "*.xcarchive" | tee found.txt
+        run: find maui-client/bin -iname "*.app" | tee found.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: BridgeToFreedom-ios-unsigned
           path: |
-            maui-client/bin/**/*.ipa
+            BridgeToFreedom-unsigned.ipa
             maui-client/bin/**/*.app
           if-no-files-found: warn
